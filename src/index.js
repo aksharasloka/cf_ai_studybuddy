@@ -1,68 +1,173 @@
+export { StudyPackWorkflow } from "./studyPackWorkflow.js";
+
 import { DurableObject } from "cloudflare:workers";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
-/**
- * Env provides a mechanism to reference bindings declared in wrangler.jsonc within JavaScript
- *
- * @typedef {Object} Env
- * @property {DurableObjectNamespace} MY_DURABLE_OBJECT - The Durable Object namespace binding
- */
+const CORS_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,OPTIONS",
+  "access-control-allow-headers": "Content-Type",
+};
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
 export class MyDurableObject extends DurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param {DurableObjectState} ctx - The interface for interacting with Durable Object state
-	 * @param {Env} env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx, env) {
-		super(ctx, env);
-	}
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx = ctx;
+  }
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param {string} name - The name provided to a Durable Object instance from a Worker
-	 * @returns {Promise<string>} The greeting to be sent back to the Worker
-	 */
-	async sayHello(name) {
-		return `Hello, ${name}!`;
-	}
+  async _get(key, fallback) {
+    const value = await this.ctx.storage.get(key);
+    return value ?? fallback;
+  }
+
+  async getState() {
+    const notes = await this._get("notes", "");
+    const messages = await this._get("messages", []);
+    const studyPack = await this._get("studyPack", null);
+    return { notes, messages, studyPack };
+  }
+
+  async setNotes(notes) {
+    await this.ctx.storage.put("notes", notes);
+    return { ok: true };
+  }
+
+  async addMessage(role, content) {
+    const messages = await this._get("messages", []);
+    messages.push({ role, content, ts: Date.now() });
+    const trimmed = messages.slice(-20);
+    await this.ctx.storage.put("messages", trimmed);
+    return { ok: true, messages: trimmed };
+  }
+
+  async setStudyPack(studyPack) {
+    await this.ctx.storage.put("studyPack", studyPack);
+    return { ok: true };
+  }
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { "content-type": "application/json", ...CORS_HEADERS },
+  });
+}
+
+function text(data, status = 200) {
+  return new Response(data, { status, headers: { ...CORS_HEADERS } });
+}
+
+async function readJson(request) {
+  try {
+    return await request.json();
+  } catch {
+    return null;
+  }
+}
+
+function pickText(resp) {
+  return (
+    resp?.response ||
+    resp?.result?.response ||
+    resp?.choices?.[0]?.message?.content ||
+    ""
+  );
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param {Request} request - The request submitted to the Worker from the client
-	 * @param {Env} env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param {ExecutionContext} ctx - The execution context of the Worker
-	 * @returns {Promise<Response>} The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx) {
-		// Create a stub to open a communication channel with the Durable Object
-		// instance named "foo".
-		//
-		// Requests from all Workers to the Durable Object instance named "foo"
-		// will go to a single remote Durable Object instance.
-		const stub = env.MY_DURABLE_OBJECT.getByName("foo");
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") return text("", 204);
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance.
-		const greeting = await stub.sayHello("world");
+    const url = new URL(request.url);
+    const path = url.pathname;
 
-		return new Response(greeting);
-	},
+    // Read body once (prevents consumed-stream bugs)
+    const body = await readJson(request);
+    const userId = url.searchParams.get("userId") || body?.userId || "demo";
+
+    const stub = env.MY_DURABLE_OBJECT.getByName(userId);
+
+    if (path === "/" && request.method === "GET") {
+      return json({ ok: true, service: "studybuddy-api", userId });
+    }
+
+    if (path === "/state" && request.method === "GET") {
+      const state = await stub.getState();
+      return json({ ok: true, userId, ...state });
+    }
+
+    if (path === "/notes" && request.method === "POST") {
+      const notes = body?.notes;
+      if (!notes || typeof notes !== "string") {
+        return json({ ok: false, error: "notes required" }, 400);
+      }
+      await stub.setNotes(notes);
+      return json({ ok: true });
+    }
+
+    if (path === "/chat" && request.method === "POST") {
+      const message = body?.message?.trim();
+      if (!message) return json({ ok: false, error: "message required" }, 400);
+
+      await stub.addMessage("user", message);
+
+      const state = await stub.getState();
+      const notes = state.notes || "";
+      const history = (state.messages || []).slice(-12).map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+      const system = {
+        role: "system",
+        content:
+          "You are StudyBuddy. Be clear, practical, and concise. Use the student’s notes when helpful.",
+      };
+
+      const notesMsg = notes
+        ? { role: "user", content: `Notes/context:\n${notes}` }
+        : null;
+
+      const messages = [system, ...(notesMsg ? [notesMsg] : []), ...history];
+
+      let reply = "";
+      let local = false;
+
+      try {
+        const resp = await env.AI.run(MODEL, { messages, max_tokens: 700 });
+        reply = pickText(resp) || "Sorry — I couldn’t generate a response.";
+      } catch {
+        local = true;
+        reply =
+          "Local dev mode: Workers AI runs remotely. Deploy this Worker (or use remote dev) to get real AI replies.";
+      }
+
+      await stub.addMessage("assistant", reply);
+      return json({ ok: true, userId, reply, local });
+    }
+
+    // Trigger workflow (async)
+    if (path === "/study-pack" && request.method === "POST") {
+      const instance = await env.STUDY_PACK.create({
+        id: crypto.randomUUID(),
+        params: { userId },
+      });
+
+      const status = await instance.status();
+      return json({ ok: true, userId, instanceId: instance.id, status });
+    }
+
+    // Check workflow status/output
+    if (path === "/study-pack/status" && request.method === "GET") {
+      const instanceId = url.searchParams.get("instanceId");
+      if (!instanceId) return json({ ok: false, error: "instanceId required" }, 400);
+
+      const instance = await env.STUDY_PACK.get(instanceId);
+      const status = await instance.status();
+      return json({ ok: true, instanceId, status });
+    }
+
+    return json({ ok: false, error: "Not found" }, 404);
+  },
 };
